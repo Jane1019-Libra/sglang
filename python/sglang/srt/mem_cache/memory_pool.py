@@ -116,7 +116,9 @@ def conv_window_dedup_enabled(
     )
 
 
-def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
+def get_tensor_size_bytes(t: Optional[Union[torch.Tensor, List[torch.Tensor]]]):
+    if t is None:
+        return 0
     if isinstance(t, list):
         return sum(get_tensor_size_bytes(x) for x in t)
     return np.prod(t.shape) * t.dtype.itemsize
@@ -341,8 +343,10 @@ class MambaPool:
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
-        intermediate_ssm: torch.Tensor
-        intermediate_conv_window: List[torch.Tensor]
+        # None in gdn_mtp_cache_mode=none; recovery reconstructs h_K after verify.
+        intermediate_ssm: Optional[torch.Tensor] = None
+        # Kept in both modes for accepted conv-state rollback.
+        intermediate_conv_window: Optional[List[torch.Tensor]] = None
 
     def __init__(
         self,
@@ -457,20 +461,12 @@ class MambaPool:
                         temporal_state_shape[-1],
                         temporal_state_shape[-2],
                     )
-                # Cache intermediate SSM states per draft token during target verify
-                # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
-                intermediate_ssm_state_cache = torch.zeros(
-                    size=(
-                        num_mamba_layers,
-                        spec_state_size + 1,
-                        speculative_num_draft_tokens,
-                        temporal_state_shape[0],
-                        temporal_state_shape[1],
-                        temporal_state_shape[2],
-                    ),
-                    dtype=ssm_dtype,
-                    device="cuda",
-                )
+                # gdn_mtp_cache_mode controls only the SSM intermediate cache.
+                # Conv windows stay cached for accepted conv-state rollback.
+                from sglang.srt.server_args import get_global_server_args
+
+                cache_mode = get_global_server_args().gdn_mtp_cache_mode
+
                 # Cache intermediate conv windows (last K-1 inputs) per draft token
                 # during target verify.
                 #
@@ -551,25 +547,62 @@ class MambaPool:
                         for conv_shape in conv_state_shape
                     ]
                     self._intermediate_conv_window_phys = intermediate_conv_window_cache
-                self.mamba_cache = self.SpeculativeState(
-                    conv=conv_state,
-                    temporal=temporal_state,
-                    intermediate_ssm=intermediate_ssm_state_cache,
-                    intermediate_conv_window=intermediate_conv_window_cache,
-                    replayssm_d=replayssm_d,
-                    replayssm_k=replayssm_k,
-                    replayssm_g=replayssm_g,
-                )
-                logger.info(
-                    f"Mamba Cache is allocated. "
-                    f"max_mamba_cache_size: {size}, "
-                    f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
-                    f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
-                    f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
-                    # Report the deduplicated PHYSICAL conv-window buffers (the view
-                    # over-reports its logical, un-deduplicated size).
-                    f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
-                )
+
+                if cache_mode == "none":
+                    # Skip intermediate_ssm, the dominant speculative MTP state cache.
+                    # Recovery reconstructs h_K from committed h_0 after verify.
+                    self.mamba_cache = self.SpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        intermediate_ssm=None,
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                        replayssm_d=replayssm_d,
+                        replayssm_k=replayssm_k,
+                        replayssm_g=replayssm_g,
+                    )
+                    logger.info(
+                        f"Mamba Cache is allocated (gdn_mtp_cache_mode=none). "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                        f"intermediate_ssm_state_cache: SKIPPED "
+                        # Report the deduplicated PHYSICAL conv-window buffers.
+                        f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
+                    )
+                else:
+                    # "full" (default): cache intermediate SSM states per draft token.
+                    # Shape: [num_layers, size + 1, speculative_num_draft_tokens, HV, K, V]
+                    intermediate_ssm_state_cache = torch.zeros(
+                        size=(
+                            num_mamba_layers,
+                            spec_state_size + 1,
+                            speculative_num_draft_tokens,
+                            temporal_state_shape[0],
+                            temporal_state_shape[1],
+                            temporal_state_shape[2],
+                        ),
+                        dtype=ssm_dtype,
+                        device="cuda",
+                    )
+                    self.mamba_cache = self.SpeculativeState(
+                        conv=conv_state,
+                        temporal=temporal_state,
+                        intermediate_ssm=intermediate_ssm_state_cache,
+                        intermediate_conv_window=intermediate_conv_window_cache,
+                        replayssm_d=replayssm_d,
+                        replayssm_k=replayssm_k,
+                        replayssm_g=replayssm_g,
+                    )
+                    logger.info(
+                        f"Mamba Cache is allocated. "
+                        f"max_mamba_cache_size: {size}, "
+                        f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
+                        f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
+                        f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_state_cache) / GB:.2f}GB "
+                        # Report the deduplicated PHYSICAL conv-window buffers (the view
+                        # over-reports its logical, un-deduplicated size).
+                        f"intermediate_conv_window_cache size: {get_tensor_size_bytes(self._intermediate_conv_window_phys) / GB:.2f}GB "
+                    )
             else:
                 self.mamba_cache = self.State(
                     conv=conv_state,
