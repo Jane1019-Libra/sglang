@@ -110,6 +110,11 @@ _is_amx_available = cpu_has_amx_support()
 
 cached_get_processor = lru_cache(get_processor)
 
+if _is_cuda:
+    from sglang.srt.layers.fused_qk_rmsnorm_rope_gate import (
+        fused_qk_gemma_rmsnorm_rope_gate,
+    )
+
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
@@ -900,6 +905,29 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def forward_prepare_cuda(self, positions, hidden_states):
+        qkv, _ = self.qkv_proj(hidden_states)
+        if self.attn_output_gate:
+            q_gate, k, v = qkv.split(
+                [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
+            )
+        else:
+            q_gate, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(
+            q_gate,
+            k,
+            self.q_norm.weight.data,
+            self.k_norm.weight.data,
+            self.rotary_emb.cos_sin_cache,
+            positions,
+            self.q_norm.variance_epsilon,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            has_gate=self.attn_output_gate,
+        )
+        return q, k, v, gate
+
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
         # Calculate first full attention layer ID based on config
@@ -928,19 +956,24 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     ) -> torch.Tensor:
         """Full attention forward pass."""
         if (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
+            _is_npu
+            and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            and self.attn_output_gate
         ):
-            q, k, v, gate = self.forward_prepare_native(
-                positions=positions,
-                hidden_states=hidden_states,
-            )
-        else:
             q, k, v, gate = self.forward_prepare_npu(
                 positions=positions,
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
+            )
+        elif _is_cuda:
+            q, k, v, gate = self.forward_prepare_cuda(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+        else:
+            q, k, v, gate = self.forward_prepare_native(
+                positions=positions,
+                hidden_states=hidden_states,
             )
 
         attn_output = self.attn(q, k, v, forward_batch)
