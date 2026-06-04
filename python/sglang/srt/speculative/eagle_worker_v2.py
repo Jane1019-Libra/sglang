@@ -661,6 +661,11 @@ class EagleDraftWorker(BaseDraftWorker):
             - 1
         )
 
+        if self.plan_stream:
+            self.plan_stream.wait_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
             forward_batch = draft_input.prepare_for_extend_to_fill_draft_kvcache(
