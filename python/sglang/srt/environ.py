@@ -720,6 +720,9 @@ class Envs:
     # Qwen3.5: fuse q/gate deinterleave + GemmaRMSNorm(q,k) + NeoX RoPE into
     # a single Triton kernel for the full-attention layers.
     SGLANG_OPT_FUSED_QK_RMSNORM_ROPE_GATE = EnvBool(True)
+    # v2: bf16 round-trip after norm (matches unfused path precision exactly).
+    # v1 (=0): all-fp32 path (diverges slightly from unfused path).
+    SGLANG_OPT_FUSED_QK_RMSNORM_ROPE_GATE_V2 = EnvBool(True)
     # Debug: run both fused and unfused paths and compare outputs.
     SGLANG_DEBUG_FUSED_QK_RMSNORM_ROPE_GATE = EnvBool(False)
 

@@ -113,6 +113,7 @@ cached_get_processor = lru_cache(get_processor)
 if _is_cuda:
     from sglang.srt.layers.fused_qk_rmsnorm_rope_gate import (
         fused_qk_gemma_rmsnorm_rope_gate,
+        fused_qk_gemma_rmsnorm_rope_gate_v2,
     )
 
 if _is_npu:
@@ -928,20 +929,39 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             )
         else:
             q_gate, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(
-            q_gate,
-            k,
-            self.q_norm.weight.data,
-            self.k_norm.weight.data,
-            self.rotary_emb.cos_sin_cache,
-            positions,
-            self.q_norm.variance_epsilon,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            rotary_dim=self.rotary_emb.rotary_dim,
-            has_gate=self.attn_output_gate,
-        )
+
+        if envs.SGLANG_OPT_FUSED_QK_RMSNORM_ROPE_GATE_V2.get():
+            # v2: bf16 round-trip, uses gemma_weight (already +1)
+            q, k, gate = fused_qk_gemma_rmsnorm_rope_gate_v2(
+                q_gate,
+                k,
+                self.q_norm.gemma_weight,
+                self.k_norm.gemma_weight,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                rotary_dim=self.rotary_emb.rotary_dim,
+                has_gate=self.attn_output_gate,
+            )
+        else:
+            # v1: all-fp32, uses raw weight (kernel adds +1)
+            q, k, gate = fused_qk_gemma_rmsnorm_rope_gate(
+                q_gate,
+                k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                rotary_dim=self.rotary_emb.rotary_dim,
+                has_gate=self.attn_output_gate,
+            )
         return q, k, v, gate
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
