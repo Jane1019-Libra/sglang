@@ -717,6 +717,12 @@ class Envs:
     # GEMM.  Saves one kernel launch when dual-stream is not used.
     SGLANG_OPT_MERGE_QKVZBA = EnvBool(True)
 
+    # Qwen3.5: fuse q/gate deinterleave + GemmaRMSNorm(q,k) + NeoX RoPE into
+    # a single Triton kernel for the full-attention layers.
+    SGLANG_OPT_FUSED_QK_RMSNORM_ROPE_GATE = EnvBool(True)
+    # Debug: run both fused and unfused paths and compare outputs.
+    SGLANG_DEBUG_FUSED_QK_RMSNORM_ROPE_GATE = EnvBool(False)
+
     # CUDA graph
     SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
 

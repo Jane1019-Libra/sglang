@@ -258,6 +258,7 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.phase_trace import phase_span
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -1452,17 +1453,38 @@ class Scheduler(
 
         while True:
             # Receive requests
-            recv_reqs = self.request_receiver.recv_requests()
-            self.process_input_requests(recv_reqs)
+            with phase_span(
+                "scheduler.recv_requests",
+                rank=self.ps.tp_rank,
+                iter=self.forward_ct + 1,
+            ):
+                recv_reqs = self.request_receiver.recv_requests()
+            with phase_span(
+                "scheduler.process_input_requests",
+                rank=self.ps.tp_rank,
+                iter=self.forward_ct + 1,
+                n=len(recv_reqs),
+            ):
+                self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
             # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
             if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
+                with phase_span(
+                    "scheduler.schedule_wait_forward",
+                    rank=self.ps.tp_rank,
+                    iter=self.forward_ct + 1,
+                ):
+                    self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
-            batch = self.get_next_batch_to_run()
+            with phase_span(
+                "scheduler.get_next_batch",
+                rank=self.ps.tp_rank,
+                iter=self.forward_ct + 1,
+            ):
+                batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
@@ -1473,7 +1495,13 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
-                batch_result = self.run_batch(batch)
+                with phase_span(
+                    "scheduler.run_batch.call",
+                    rank=self.ps.tp_rank,
+                    iter=self.forward_ct + 1,
+                    mode=batch.forward_mode.name,
+                ):
+                    batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
@@ -1489,7 +1517,13 @@ class Scheduler(
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
             if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result)
+                with phase_span(
+                    "scheduler.launch_sample_if_needed",
+                    rank=self.ps.tp_rank,
+                    iter=self.forward_ct,
+                    has_result=batch_result is not None,
+                ):
+                    self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
             self.last_batch = batch
@@ -2956,6 +2990,20 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
+        with phase_span(
+            "scheduler.run_batch",
+            rank=self.ps.tp_rank,
+            iter=self.forward_ct + 1,
+            mode=batch.forward_mode.name,
+            bs=len(batch.reqs),
+        ):
+            return self._run_batch_traced(batch, pp_proxy_tensors)
+
+    def _run_batch_traced(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
@@ -2974,15 +3022,33 @@ class Scheduler(
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
-                self.future_map.resolve_seq_lens_cpu(batch)
+                with phase_span(
+                    "scheduler.resolve_seq_lens_cpu",
+                    rank=self.ps.tp_rank,
+                    iter=self.forward_ct,
+                    mode=batch.forward_mode.name,
+                ):
+                    self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self.forward_stream_ctx:
-                    self.forward_stream.wait_stream(self.schedule_stream)
+                    with phase_span(
+                        "scheduler.forward_wait_schedule",
+                        rank=self.ps.tp_rank,
+                        iter=self.forward_ct,
+                        mode=batch.forward_mode.name,
+                    ):
+                        self.forward_stream.wait_stream(self.schedule_stream)
                     # resolve consumes SB staging (prefill_input_ids_cpu /
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
-                    resolve_forward_inputs(batch, self.future_map)
+                    with phase_span(
+                        "scheduler.resolve_forward_inputs",
+                        rank=self.ps.tp_rank,
+                        iter=self.forward_ct,
+                        mode=batch.forward_mode.name,
+                    ):
+                        resolve_forward_inputs(batch, self.future_map)
 
                     with self._overlap_forward_isolation(batch):
                         future_indices = batch.req_pool_indices
@@ -3130,17 +3196,32 @@ class Scheduler(
             return
 
         with self.forward_stream_ctx:
-            self.forward_stream.wait_stream(self.schedule_stream)
-            _batch_result = batch_result.delay_sample_func()
+            with phase_span(
+                "scheduler.sample_wait_schedule",
+                rank=self.ps.tp_rank,
+                iter=self.forward_ct,
+            ):
+                self.forward_stream.wait_stream(self.schedule_stream)
+            with phase_span(
+                "scheduler.delay_sample_func",
+                rank=self.ps.tp_rank,
+                iter=self.forward_ct,
+            ):
+                _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             # Delay-sample is non-spec only; stash takes next_token_ids tensor.
             self.future_map.stash(
                 batch_result.future_indices, batch_result.next_token_ids
             )
-            batch_result.copy_to_cpu(
-                return_logprob=self.cur_batch.return_logprob,
-                return_hidden_states=self.cur_batch.return_hidden_states,
-            )
+            with phase_span(
+                "scheduler.sample_copy_to_cpu",
+                rank=self.ps.tp_rank,
+                iter=self.forward_ct,
+            ):
+                batch_result.copy_to_cpu(
+                    return_logprob=self.cur_batch.return_logprob,
+                    return_hidden_states=self.cur_batch.return_hidden_states,
+                )
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds

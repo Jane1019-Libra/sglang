@@ -81,6 +81,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+from sglang.srt.utils.phase_trace import phase_span
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 try:
@@ -1278,39 +1279,55 @@ class CudaGraphRunner:
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
-        self.deepep_adapter.replay()
+        trace_fields = {
+            "rank": self.model_runner.tp_rank,
+            "pass_id": self.model_runner.forward_pass_id,
+            "mode": forward_batch.forward_mode.name,
+        }
+        with phase_span("cuda_graph.replay", **trace_fields):
+            with phase_span("cuda_graph.deepep_adapter", **trace_fields):
+                self.deepep_adapter.replay()
 
-        if not skip_attn_backend_init:
-            self.replay_prepare(forward_batch, pp_proxy_tensors)
-        else:
-            # In speculative decoding, these two fields are still needed.
-            self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
-            self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
-            if (
-                self.model_runner.spec_algorithm.is_dflash()
-                and self.model_runner.is_draft_worker
-                and forward_batch.input_embeds is not None
-            ):
-                self.buffers.input_embeds[: self.raw_num_token].copy_(
-                    forward_batch.input_embeds
+            if not skip_attn_backend_init:
+                with phase_span("cuda_graph.replay_prepare", **trace_fields):
+                    self.replay_prepare(forward_batch, pp_proxy_tensors)
+            else:
+                # In speculative decoding, these two fields are still needed.
+                with phase_span("cuda_graph.copy_inputs_skip_prepare", **trace_fields):
+                    self.buffers.input_ids[: self.raw_num_token].copy_(
+                        forward_batch.input_ids
+                    )
+                    self.buffers.positions[: self.raw_num_token].copy_(
+                        forward_batch.positions
+                    )
+                    if (
+                        self.model_runner.spec_algorithm.is_dflash()
+                        and self.model_runner.is_draft_worker
+                        and forward_batch.input_embeds is not None
+                    ):
+                        self.buffers.input_embeds[: self.raw_num_token].copy_(
+                            forward_batch.input_embeds
+                        )
+
+            # Replay
+            if self.enable_pdmux:
+                graph_key = f"{get_current_stream_idx()}_{self.bs}"
+            else:
+                graph_key = self.bs
+            ctx = (
+                self.model_runner.device_timer.wrap(
+                    metadata={
+                        "category": forward_batch.forward_mode.name.lower(),
+                    }
                 )
-
-        # Replay
-        if self.enable_pdmux:
-            graph_key = f"{get_current_stream_idx()}_{self.bs}"
-        else:
-            graph_key = self.bs
-        ctx = (
-            self.model_runner.device_timer.wrap(
-                metadata={
-                    "category": forward_batch.forward_mode.name.lower(),
-                }
+                if self.model_runner.device_timer
+                else contextlib.nullcontext()
             )
-            if self.model_runner.device_timer
-            else contextlib.nullcontext()
-        )
-        with ctx:
-            self.graphs[graph_key].replay()
+            with phase_span(
+                "cuda_graph.graph_replay_call", key=graph_key, **trace_fields
+            ):
+                with ctx:
+                    self.graphs[graph_key].replay()
 
         output = self.output_buffers[graph_key]
 

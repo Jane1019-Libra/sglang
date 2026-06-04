@@ -5,11 +5,15 @@ Qwen3_5AttentionDecoderLayer.forward_prepare_native:
   1. Q/Gate deinterleave (view + chunk)
   2. GemmaRMSNorm on Q (per-head)
   3. GemmaRMSNorm on K (per-head)
-  4. NeoX RoPE on Q and K
+  4. NeoX RoPE on Q and K (partial or full rotation)
 
 Grid: (num_tokens, num_q_heads + num_kv_heads).
   pid_h < num_q_heads: Q programs (deinterleave + norm + RoPE + store gate)
   pid_h >= num_q_heads: K programs (norm + RoPE)
+
+Supports partial_rotary_factor < 1.0: only the first ROTARY_DIM elements of
+each head get RoPE; the remaining elements are normalized but not rotated
+(e.g. Qwen3.5 MoE: head_dim=256, partial_rotary_factor=0.25, rotary_dim=64).
 """
 
 from typing import Optional, Tuple
@@ -49,7 +53,11 @@ def _fused_qk_gemma_rmsnorm_rope_gate_kernel(
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
-    HALF_DIM: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
+    HALF_ROTARY: tl.constexpr,
+    HAS_NOPE: tl.constexpr,
+    NOPE_BLOCK: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
     HAS_GATE: tl.constexpr,
 ):
     pid_t = tl.program_id(0)
@@ -58,92 +66,146 @@ def _fused_qk_gemma_rmsnorm_rope_gate_kernel(
     if pid_t >= num_tokens:
         return
 
-    half_offs = tl.arange(0, HALF_DIM)
+    rot_offs = tl.arange(0, HALF_ROTARY)
 
     # Load cos/sin for this token's position
     pos = tl.load(positions_ptr + pid_t)
     cos_base = pos * stride_cos_t
-    cos = tl.load(cos_sin_cache_ptr + cos_base + half_offs).to(tl.float32)
-    sin = tl.load(cos_sin_cache_ptr + cos_base + HALF_DIM + half_offs).to(tl.float32)
+    cos = tl.load(cos_sin_cache_ptr + cos_base + rot_offs).to(tl.float32)
+    sin = tl.load(cos_sin_cache_ptr + cos_base + HALF_ROTARY + rot_offs).to(tl.float32)
 
     if pid_h < NUM_Q_HEADS:
-        # === Q path: deinterleave + GemmaRMSNorm + NeoX RoPE ===
+        # === Q path ===
         head_id = pid_h
-
         if HAS_GATE:
-            # q_gate layout: [T, num_q_heads * 2 * head_dim]
-            # For head h: q at offset h*2*HEAD_DIM, gate at h*2*HEAD_DIM + HEAD_DIM
             q_base = pid_t * stride_qg_t + head_id * 2 * HEAD_DIM
         else:
-            # q layout: [T, num_q_heads * head_dim]
             q_base = pid_t * stride_qg_t + head_id * HEAD_DIM
 
-        # Load Q as two halves
-        q1 = tl.load(q_gate_ptr + q_base + half_offs).to(tl.float32)
-        q2 = tl.load(q_gate_ptr + q_base + HALF_DIM + half_offs).to(tl.float32)
+        # Load rotary portion as two halves
+        q_r1 = tl.load(q_gate_ptr + q_base + rot_offs).to(tl.float32)
+        q_r2 = tl.load(q_gate_ptr + q_base + HALF_ROTARY + rot_offs).to(tl.float32)
+        var_acc = tl.sum(q_r1 * q_r1) + tl.sum(q_r2 * q_r2)
 
+        # Load nope portion
+        if HAS_NOPE:
+            nope_offs = tl.arange(0, NOPE_BLOCK)
+            nope_mask = nope_offs < NOPE_DIM
+            q_nope = tl.load(
+                q_gate_ptr + q_base + ROTARY_DIM + nope_offs,
+                mask=nope_mask,
+                other=0.0,
+            ).to(tl.float32)
+            var_acc += tl.sum(q_nope * q_nope)
+
+        # Gate passthrough
         if HAS_GATE:
-            # Load and store gate (passthrough, no processing)
             gate_base = q_base + HEAD_DIM
-            g1 = tl.load(q_gate_ptr + gate_base + half_offs)
-            g2 = tl.load(q_gate_ptr + gate_base + HALF_DIM + half_offs)
+            g_r1 = tl.load(q_gate_ptr + gate_base + rot_offs)
+            g_r2 = tl.load(q_gate_ptr + gate_base + HALF_ROTARY + rot_offs)
             gate_out_base = pid_t * stride_gate_t + head_id * stride_gate_h
-            tl.store(gate_out_ptr + gate_out_base + half_offs, g1)
-            tl.store(gate_out_ptr + gate_out_base + HALF_DIM + half_offs, g2)
+            tl.store(gate_out_ptr + gate_out_base + rot_offs, g_r1)
+            tl.store(gate_out_ptr + gate_out_base + HALF_ROTARY + rot_offs, g_r2)
+            if HAS_NOPE:
+                g_nope = tl.load(
+                    q_gate_ptr + gate_base + ROTARY_DIM + nope_offs,
+                    mask=nope_mask,
+                )
+                tl.store(
+                    gate_out_ptr + gate_out_base + ROTARY_DIM + nope_offs,
+                    g_nope,
+                    mask=nope_mask,
+                )
 
-        # GemmaRMSNorm: out = x * rsqrt(mean(x^2) + eps) * (weight + 1.0)
-        w1 = tl.load(q_weight_ptr + half_offs).to(tl.float32) + 1.0
-        w2 = tl.load(q_weight_ptr + HALF_DIM + half_offs).to(tl.float32) + 1.0
-        q_var = (tl.sum(q1 * q1) + tl.sum(q2 * q2)) / HEAD_DIM
+        # GemmaRMSNorm
+        q_var = var_acc / HEAD_DIM
         q_rstd = tl.math.rsqrt(q_var + eps)
-        q1_n = q1 * q_rstd * w1
-        q2_n = q2 * q_rstd * w2
+        w_r1 = tl.load(q_weight_ptr + rot_offs).to(tl.float32) + 1.0
+        w_r2 = tl.load(q_weight_ptr + HALF_ROTARY + rot_offs).to(tl.float32) + 1.0
+        q_r1_n = q_r1 * q_rstd * w_r1
+        q_r2_n = q_r2 * q_rstd * w_r2
 
-        # NeoX RoPE: o1 = x1*cos - x2*sin, o2 = x2*cos + x1*sin
-        o1 = q1_n * cos - q2_n * sin
-        o2 = q2_n * cos + q1_n * sin
+        # NeoX RoPE on rotary portion
+        o1 = q_r1_n * cos - q_r2_n * sin
+        o2 = q_r2_n * cos + q_r1_n * sin
 
-        # Store Q output
+        # Store Q
         q_out_base = pid_t * stride_qo_t + head_id * HEAD_DIM
+        tl.store(q_out_ptr + q_out_base + rot_offs, o1.to(q_out_ptr.dtype.element_ty))
         tl.store(
-            q_out_ptr + q_out_base + half_offs,
-            o1.to(q_out_ptr.dtype.element_ty),
-        )
-        tl.store(
-            q_out_ptr + q_out_base + HALF_DIM + half_offs,
+            q_out_ptr + q_out_base + HALF_ROTARY + rot_offs,
             o2.to(q_out_ptr.dtype.element_ty),
         )
+
+        if HAS_NOPE:
+            w_nope = (
+                tl.load(
+                    q_weight_ptr + ROTARY_DIM + nope_offs,
+                    mask=nope_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                + 1.0
+            )
+            q_nope_n = q_nope * q_rstd * w_nope
+            tl.store(
+                q_out_ptr + q_out_base + ROTARY_DIM + nope_offs,
+                q_nope_n.to(q_out_ptr.dtype.element_ty),
+                mask=nope_mask,
+            )
     else:
-        # === K path: GemmaRMSNorm + NeoX RoPE ===
+        # === K path ===
         kv_head_id = pid_h - NUM_Q_HEADS
         k_base = pid_t * stride_k_t + kv_head_id * HEAD_DIM
 
-        # Load K as two halves
-        k1 = tl.load(k_ptr + k_base + half_offs).to(tl.float32)
-        k2 = tl.load(k_ptr + k_base + HALF_DIM + half_offs).to(tl.float32)
+        k_r1 = tl.load(k_ptr + k_base + rot_offs).to(tl.float32)
+        k_r2 = tl.load(k_ptr + k_base + HALF_ROTARY + rot_offs).to(tl.float32)
+        var_acc = tl.sum(k_r1 * k_r1) + tl.sum(k_r2 * k_r2)
+
+        if HAS_NOPE:
+            nope_offs = tl.arange(0, NOPE_BLOCK)
+            nope_mask = nope_offs < NOPE_DIM
+            k_nope = tl.load(
+                k_ptr + k_base + ROTARY_DIM + nope_offs,
+                mask=nope_mask,
+                other=0.0,
+            ).to(tl.float32)
+            var_acc += tl.sum(k_nope * k_nope)
 
         # GemmaRMSNorm
-        w1 = tl.load(k_weight_ptr + half_offs).to(tl.float32) + 1.0
-        w2 = tl.load(k_weight_ptr + HALF_DIM + half_offs).to(tl.float32) + 1.0
-        k_var = (tl.sum(k1 * k1) + tl.sum(k2 * k2)) / HEAD_DIM
+        k_var = var_acc / HEAD_DIM
         k_rstd = tl.math.rsqrt(k_var + eps)
-        k1_n = k1 * k_rstd * w1
-        k2_n = k2 * k_rstd * w2
+        w_r1 = tl.load(k_weight_ptr + rot_offs).to(tl.float32) + 1.0
+        w_r2 = tl.load(k_weight_ptr + HALF_ROTARY + rot_offs).to(tl.float32) + 1.0
+        k_r1_n = k_r1 * k_rstd * w_r1
+        k_r2_n = k_r2 * k_rstd * w_r2
 
         # NeoX RoPE
-        o1 = k1_n * cos - k2_n * sin
-        o2 = k2_n * cos + k1_n * sin
+        o1 = k_r1_n * cos - k_r2_n * sin
+        o2 = k_r2_n * cos + k_r1_n * sin
 
-        # Store K output
+        # Store K
         k_out_base = pid_t * stride_ko_t + kv_head_id * HEAD_DIM
+        tl.store(k_out_ptr + k_out_base + rot_offs, o1.to(k_out_ptr.dtype.element_ty))
         tl.store(
-            k_out_ptr + k_out_base + half_offs,
-            o1.to(k_out_ptr.dtype.element_ty),
-        )
-        tl.store(
-            k_out_ptr + k_out_base + HALF_DIM + half_offs,
+            k_out_ptr + k_out_base + HALF_ROTARY + rot_offs,
             o2.to(k_out_ptr.dtype.element_ty),
         )
+
+        if HAS_NOPE:
+            w_nope = (
+                tl.load(
+                    k_weight_ptr + ROTARY_DIM + nope_offs,
+                    mask=nope_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                + 1.0
+            )
+            k_nope_n = k_nope * k_rstd * w_nope
+            tl.store(
+                k_out_ptr + k_out_base + ROTARY_DIM + nope_offs,
+                k_nope_n.to(k_out_ptr.dtype.element_ty),
+                mask=nope_mask,
+            )
 
 
 def fused_qk_gemma_rmsnorm_rope_gate(
@@ -157,6 +219,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
     num_q_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    rotary_dim: Optional[int] = None,
     has_gate: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Fused Q/K GemmaRMSNorm + NeoX RoPE + optional gate deinterleave.
@@ -167,12 +230,13 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         k: [T, num_kv_heads * head_dim]. May be non-contiguous.
         q_weight: [head_dim] raw GemmaRMSNorm weight (kernel applies +1.0).
         k_weight: [head_dim] raw GemmaRMSNorm weight.
-        cos_sin_cache: [max_pos, head_dim] = [cos(half) || sin(half)].
+        cos_sin_cache: [max_pos, rotary_dim] = [cos(half) || sin(half)].
         positions: [T] int token positions.
         eps: RMSNorm epsilon.
         num_q_heads: Number of Q heads (after TP split).
         num_kv_heads: Number of KV heads (after TP split).
         head_dim: Head dimension.
+        rotary_dim: Rotary embedding dimension. Defaults to head_dim (full).
         has_gate: Whether q_gate contains interleaved Q+gate.
 
     Returns:
@@ -181,10 +245,16 @@ def fused_qk_gemma_rmsnorm_rope_gate(
           k: [T, num_kv_heads * head_dim]
           gate: [T, num_q_heads, head_dim] if has_gate else None
     """
+    if rotary_dim is None:
+        rotary_dim = head_dim
+
     T = q_gate.shape[0]
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
-    HALF_DIM = head_dim // 2
+    HALF_ROTARY = rotary_dim // 2
+    NOPE_DIM = head_dim - rotary_dim
+    HAS_NOPE = NOPE_DIM > 0
+    NOPE_BLOCK = triton.next_power_of_2(NOPE_DIM) if NOPE_DIM > 0 else 1
 
     q_out = torch.empty(T, q_size, dtype=q_gate.dtype, device=q_gate.device)
     k_out = torch.empty(T, kv_size, dtype=k.dtype, device=k.device)
@@ -194,7 +264,7 @@ def fused_qk_gemma_rmsnorm_rope_gate(
             T, num_q_heads, head_dim, dtype=q_gate.dtype, device=q_gate.device
         )
     else:
-        gate_out = q_out  # dummy, won't be written
+        gate_out = q_out  # dummy
 
     num_warps = 4 if head_dim <= 128 else 8
 
@@ -221,7 +291,11 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         NUM_Q_HEADS=num_q_heads,
         NUM_KV_HEADS=num_kv_heads,
         HEAD_DIM=head_dim,
-        HALF_DIM=HALF_DIM,
+        ROTARY_DIM=rotary_dim,
+        HALF_ROTARY=HALF_ROTARY,
+        HAS_NOPE=HAS_NOPE,
+        NOPE_BLOCK=NOPE_BLOCK,
+        NOPE_DIM=NOPE_DIM,
         HAS_GATE=has_gate,
         num_warps=num_warps,
     )

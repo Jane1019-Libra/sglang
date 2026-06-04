@@ -121,6 +121,21 @@ if _is_npu:
     )
 
 
+def _debug_compare(fused: torch.Tensor, ref: torch.Tensor, name: str):
+    """Log max abs/rel diff between fused and reference tensors."""
+    diff = (fused.float() - ref.float()).abs()
+    abs_err = diff.max().item()
+    denom = ref.float().abs().clamp(min=1e-6)
+    rel_err = (diff / denom).max().item()
+    logger.warning(
+        "FUSED_DEBUG %s: max_abs=%.6e  max_rel=%.6e  shape=%s",
+        name,
+        abs_err,
+        rel_err,
+        list(fused.shape),
+    )
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -924,6 +939,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.num_heads,
             self.num_kv_heads,
             self.head_dim,
+            rotary_dim=self.rotary_emb.rotary_dim,
             has_gate=self.attn_output_gate,
         )
         return q, k, v, gate
@@ -955,6 +971,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
+        use_fused = _is_cuda and envs.SGLANG_OPT_FUSED_QK_RMSNORM_ROPE_GATE.get()
+        debug_fused = _is_cuda and envs.SGLANG_DEBUG_FUSED_QK_RMSNORM_ROPE_GATE.get()
+
         if (
             _is_npu
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -965,11 +984,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        elif _is_cuda:
+        elif use_fused or debug_fused:
             q, k, v, gate = self.forward_prepare_cuda(
                 positions=positions,
                 hidden_states=hidden_states,
             )
+            if debug_fused:
+                q_ref, k_ref, v_ref, gate_ref = self.forward_prepare_native(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                )
+                _debug_compare(q, q_ref, "q")
+                _debug_compare(k, k_ref, "k")
+                if gate is not None and gate_ref is not None:
+                    _debug_compare(
+                        (
+                            gate.reshape_as(gate_ref)
+                            if gate.shape != gate_ref.shape
+                            else gate
+                        ),
+                        gate_ref,
+                        "gate",
+                    )
+                if not use_fused:
+                    q, k, v, gate = q_ref, k_ref, v_ref, gate_ref
         else:
             q, k, v, gate = self.forward_prepare_native(
                 positions=positions,

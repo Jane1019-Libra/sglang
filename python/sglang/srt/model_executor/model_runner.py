@@ -223,6 +223,7 @@ from sglang.srt.utils.patch_torch import (
     monkey_patch_torch_reductions,
     register_sgl_tp_rank,
 )
+from sglang.srt.utils.phase_trace import phase_span
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_checker import WeightChecker
 from sglang.srt.weight_sync.tensor_bucket import (
@@ -3097,16 +3098,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else contextlib.nullcontext()
             )
             with ctx:
-                ret = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+                with phase_span(
+                    "model_runner.piecewise_graph_replay",
+                    rank=self.tp_rank,
+                    pass_id=self.forward_pass_id,
+                    mode=forward_batch.forward_mode.name,
+                ):
+                    ret = self.piecewise_cuda_graph_runner.replay(
+                        forward_batch, **kwargs
+                    )
             return (ret, can_run_graph)
 
         # Launch model forward
         if not skip_attn_backend_init:
-            if hasattr(self.model, "prepare_forward_batch"):
-                # Prepare model-specific attention metadata before planning,
-                # e.g. Moss-VL's prefill cross-attention custom mask.
-                self.model.prepare_forward_batch(forward_batch)
-            self.attn_backend.init_forward_metadata(forward_batch)
+            with phase_span(
+                "model_runner.init_forward_metadata",
+                rank=self.tp_rank,
+                pass_id=self.forward_pass_id,
+                mode=forward_batch.forward_mode.name,
+            ):
+                if hasattr(self.model, "prepare_forward_batch"):
+                    # Prepare model-specific attention metadata before planning,
+                    # e.g. Moss-VL's prefill cross-attention custom mask.
+                    self.model.prepare_forward_batch(forward_batch)
+                self.attn_backend.init_forward_metadata(forward_batch)
 
         ctx = (
             self.device_timer.wrap(metadata={"category": "extend"})
@@ -3114,12 +3129,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else contextlib.nullcontext()
         )
         with ctx:
-            ret = self.model.forward(
-                forward_batch.input_ids,
-                forward_batch.positions,
-                forward_batch,
-                **kwargs,
-            )
+            with phase_span(
+                "model_runner.model_forward",
+                rank=self.tp_rank,
+                pass_id=self.forward_pass_id,
+                mode=forward_batch.forward_mode.name,
+            ):
+                ret = self.model.forward(
+                    forward_batch.input_ids,
+                    forward_batch.positions,
+                    forward_batch,
+                    **kwargs,
+                )
         return (ret, can_run_graph)
 
     def forward_idle(
@@ -3189,6 +3210,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        trace_fields = {
+            "rank": self.tp_rank,
+            "pass_id": self.forward_pass_id,
+            "mode": forward_batch.forward_mode.name,
+        }
 
         # Try msprob debugger
         if self.msprobe_debugger is not None:
@@ -3205,6 +3231,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         with (
             step_span_ctx,
+            phase_span("model_runner.forward", **trace_fields),
             get_global_expert_distribution_recorder().with_forward_pass(
                 self.forward_pass_id,
                 forward_batch,

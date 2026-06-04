@@ -86,6 +86,7 @@ from sglang.srt.utils.common import (
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.utils.phase_trace import phase_span
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
@@ -870,6 +871,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         pass
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+        trace_fields = {
+            "rank": self.tp_rank,
+            "iter": getattr(batch, "forward_iter", -1),
+            "mode": batch.forward_mode.name,
+        }
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (
@@ -878,74 +884,81 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 else CaptureHiddenMode.FULL
             )
             batch.capture_hidden_mode = target_capture_mode
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            with phase_span("eagle_v2.forward_batch_generation", **trace_fields):
+                with phase_span("eagle_v2.target_prefill", **trace_fields):
+                    batch_output = self.target_worker.forward_batch_generation(batch)
 
-            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
-            # Extend processed L prompt tokens; next verify iter expects same L.
-            batch_output.new_seq_lens = batch.seq_lens
-            # Publish before draft_extend so the fence is at target-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
+                # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
+                # Extend processed L prompt tokens; next verify iter expects same L.
+                batch_output.new_seq_lens = batch.seq_lens
+                # Publish before draft_extend so the fence is at target-end.
+                if on_publish is not None:
+                    on_publish(batch_output.new_seq_lens)
 
-            # Draft prefill
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
-                batch_output.next_draft_input = (
-                    self.draft_worker._draft_extend_for_prefill(
-                        batch,
-                        batch_output.logits_output.hidden_states,
-                        batch_output.next_token_ids,
-                        batch_output.logits_output.mm_input_embeds,
+                # Draft prefill
+                with (
+                    phase_span("eagle_v2.draft_prefill", **trace_fields),
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                ):
+                    batch_output.next_draft_input = (
+                        self.draft_worker._draft_extend_for_prefill(
+                            batch,
+                            batch_output.logits_output.hidden_states,
+                            batch_output.next_token_ids,
+                            batch_output.logits_output.mm_input_embeds,
+                        )
                     )
-                )
-                return batch_output
+                    return batch_output
         else:
-            if batch.spec_info is None:
-                capture_mode = (
-                    CaptureHiddenMode.NULL
-                    if self.speculative_algorithm.is_standalone()
-                    else CaptureHiddenMode.LAST
-                )
-                batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
-                    dtype=EagleDraftInput.dtype_for(self.draft_worker),
-                    topk=self.topk,
-                    capture_hidden_mode=capture_mode,
-                )
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
-                verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
-            assert verify_input.is_verify_input()
-            batch.spec_info = verify_input
-            batch_output = self.verify(batch)
-            # Publish before draft_extend so the fence is at verify-end.
-            if on_publish is not None:
-                on_publish(batch_output.new_seq_lens)
-            with (
-                self.draft_worker.draft_tp_context(
-                    self.draft_worker.draft_runner.tp_group
-                ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
-                self.draft_worker._draft_extend_for_decode(batch, batch_output)
+            with phase_span("eagle_v2.forward_batch_generation", **trace_fields):
+                if batch.spec_info is None:
+                    capture_mode = (
+                        CaptureHiddenMode.NULL
+                        if self.speculative_algorithm.is_standalone()
+                        else CaptureHiddenMode.LAST
+                    )
+                    batch.spec_info = EagleDraftInput.create_idle_input(
+                        device=self.device,
+                        hidden_size=EagleDraftInput.hidden_size_for(self.draft_worker),
+                        dtype=EagleDraftInput.dtype_for(self.draft_worker),
+                        topk=self.topk,
+                        capture_hidden_mode=capture_mode,
+                    )
+                with (
+                    phase_span("eagle_v2.draft", **trace_fields),
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                ):
+                    verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+                assert verify_input.is_verify_input()
+                batch.spec_info = verify_input
+                batch_output = self.verify(batch)
+                # Publish before draft_extend so the fence is at verify-end.
+                if on_publish is not None:
+                    on_publish(batch_output.new_seq_lens)
+                with (
+                    phase_span("eagle_v2.draft_extend_decode", **trace_fields),
+                    self.draft_worker.draft_tp_context(
+                        self.draft_worker.draft_runner.tp_group
+                    ),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                ):
+                    self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
-            # Wait for mamba side stream to finish before returning
-            if self._mamba_side_stream_active:
-                torch.cuda.current_stream().wait_stream(self._mamba_side_stream)
+                # Wait for mamba side stream to finish before returning
+                if self._mamba_side_stream_active:
+                    with phase_span("eagle_v2.wait_mamba_side_stream", **trace_fields):
+                        torch.cuda.current_stream().wait_stream(self._mamba_side_stream)
 
-            return batch_output
+                return batch_output
 
     def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
         if self.adaptive_controller is not None:
@@ -1089,94 +1102,113 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ) = backup
 
     def verify(self, batch: ScheduleBatch):
-        fwd_stream = torch.get_device_module(self.device).current_stream()
-        verify_input: EagleVerifyInput = batch.spec_info
-        record_stream_for_v2_verify(batch, verify_input, fwd_stream)
+        trace_fields = {
+            "rank": self.tp_rank,
+            "iter": getattr(batch, "forward_iter", -1),
+            "mode": batch.forward_mode.name,
+        }
+        with phase_span("eagle_v2.verify_start", **trace_fields):
+            pass
 
-        verify_input.num_tokens_per_req = self.speculative_num_steps + 1
-        bs = len(batch.seq_lens)
+        with phase_span("eagle_v2.verify_prepare", **trace_fields):
+            fwd_stream = torch.get_device_module(self.device).current_stream()
+            verify_input: EagleVerifyInput = batch.spec_info
+            record_stream_for_v2_verify(batch, verify_input, fwd_stream)
 
-        # Batch 1: Target verify
-        # Prepare for target verify in a separate stream.
-        # The plan stream must wait for draft kernels on the forward stream
-        # to finish: prepare_for_v2_verify reads draft output (draft_token,
-        # req_to_token) and replay_prepare touches mamba state indices that
-        # draft may still be writing.
-        if self.plan_stream:
-            self.plan_stream.wait_stream(fwd_stream)
-        with self.plan_stream_ctx:
-            verify_forward_batch, can_run_cuda_graph = (
-                verify_input.prepare_for_v2_verify(
-                    self.req_to_token_pool,
-                    batch,
-                    self.target_worker,
+            verify_input.num_tokens_per_req = self.speculative_num_steps + 1
+            bs = len(batch.seq_lens)
+
+            # Batch 1: Target verify
+            # Prepare for target verify in a separate stream.
+            # The plan stream must wait for draft kernels on the forward stream
+            # to finish: prepare_for_v2_verify reads draft output (draft_token,
+            # req_to_token) and replay_prepare touches mamba state indices that
+            # draft may still be writing.
+            if self.plan_stream:
+                with phase_span("eagle_v2.plan_wait_forward", **trace_fields):
+                    self.plan_stream.wait_stream(fwd_stream)
+            with self.plan_stream_ctx:
+                with phase_span("eagle_v2.prepare_for_verify", **trace_fields):
+                    verify_forward_batch, can_run_cuda_graph = (
+                        verify_input.prepare_for_v2_verify(
+                            self.req_to_token_pool,
+                            batch,
+                            self.target_worker,
+                        )
+                    )
+
+            # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
+            record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
+
+            # Correct some buffers due to the overlap plan
+            if self.plan_stream:
+                with phase_span("eagle_v2.forward_wait_plan", **trace_fields):
+                    torch.get_device_module(self.device).current_stream().wait_stream(
+                        self.plan_stream
+                    )
+                if (
+                    _is_npu
+                    and self._target_worker.model_runner.model_is_mrope
+                    and batch.spec_info is not None
+                    and getattr(batch.spec_info, "positions", None) is not None
+                    and not batch.forward_mode.is_idle()
+                ):
+                    # mrope_position depends on draft output in default stream and is computed in plan stream,
+                    # causing errors. Compute it here for correct values.
+                    verify_forward_batch.compute_spec_mrope_positions(
+                        self._target_worker.model_runner, batch
+                    )
+
+                # Some values such as custom_mask and position depend on the output of draft,
+                # so the previous plan step used the wrong values. Here, we need to run the related
+                # computation again to update them to the correct values.
+                self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
+                    verify_input,
+                    (
+                        self.target_worker.model_runner.graph_runner.bs
+                        if can_run_cuda_graph
+                        else None
+                    ),
                 )
-            )
-
-        # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
-        record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
-
-        # Correct some buffers due to the overlap plan
-        if self.plan_stream:
-            torch.get_device_module(self.device).current_stream().wait_stream(
-                self.plan_stream
-            )
-            if (
-                _is_npu
-                and self._target_worker.model_runner.model_is_mrope
-                and batch.spec_info is not None
-                and getattr(batch.spec_info, "positions", None) is not None
-                and not batch.forward_mode.is_idle()
-            ):
-                # mrope_position depends on draft output in default stream and is computed in plan stream,
-                # causing errors. Compute it here for correct values.
-                verify_forward_batch.compute_spec_mrope_positions(
-                    self._target_worker.model_runner, batch
-                )
-
-            # Some values such as custom_mask and position depend on the output of draft,
-            # so the previous plan step used the wrong values. Here, we need to run the related
-            # computation again to update them to the correct values.
-            self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
-                verify_input,
-                (
-                    self.target_worker.model_runner.graph_runner.bs
-                    if can_run_cuda_graph
-                    else None
-                ),
-            )
 
         # Prepare grammar data on CPU if needed
         if batch.has_grammar:
-            retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
-            retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
-            draft_tokens_cpu = verify_input.draft_token.view(
-                verify_input.retrieve_next_token.shape
-            ).cpu()
+            with phase_span("eagle_v2.grammar_cpu_prepare", **trace_fields):
+                retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+                retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
+                draft_tokens_cpu = verify_input.draft_token.view(
+                    verify_input.retrieve_next_token.shape
+                ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute).
         # Only skip metadata init when cuda-graph already ran replay_prepare;
         # the non-cuda-graph path needs forward_extend's init (post-pad).
-        forward_batch_output = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=can_run_cuda_graph,
-        )
+        with phase_span(
+            "eagle_v2.target_verify_forward",
+            can_graph=can_run_cuda_graph,
+            **trace_fields,
+        ):
+            forward_batch_output = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=can_run_cuda_graph,
+            )
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding
         vocab_mask = None
         if batch.has_grammar:
             # Generate the logit mask for structured output.
-            vocab_mask = generate_token_bitmask(
-                batch.reqs,
-                verify_input,
-                retrieve_next_token_cpu,
-                retrieve_next_sibling_cpu,
-                draft_tokens_cpu,
-                batch.sampling_info.vocab_size,
-            )
+            with phase_span("eagle_v2.generate_vocab_mask", **trace_fields):
+                vocab_mask = generate_token_bitmask(
+                    batch.reqs,
+                    verify_input,
+                    retrieve_next_token_cpu,
+                    retrieve_next_sibling_cpu,
+                    draft_tokens_cpu,
+                    batch.sampling_info.vocab_size,
+                )
 
             if vocab_mask is not None:
                 assert verify_input.grammar is not None
@@ -1188,11 +1220,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-        (
-            predict,
-            accept_lens,
-            accept_index,
-        ) = verify_input.sample(batch, logits_output, vocab_mask)
+        with phase_span("eagle_v2.verify_sample", **trace_fields):
+            (
+                predict,
+                accept_lens,
+                accept_index,
+            ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification.
@@ -1206,11 +1239,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if self._mamba_side_stream is None:
                 self._mamba_side_stream = torch.cuda.Stream()
             main_stream = torch.cuda.current_stream()
-            self._mamba_side_stream.wait_stream(main_stream)
+            with phase_span("eagle_v2.mamba_side_wait_main", **trace_fields):
+                self._mamba_side_stream.wait_stream(main_stream)
             with torch.cuda.stream(self._mamba_side_stream):
-                self._mamba_verify_update(
-                    batch, verify_input, accept_lens, accept_index, bs
-                )
+                with phase_span("eagle_v2.mamba_verify_update", **trace_fields):
+                    self._mamba_verify_update(
+                        batch, verify_input, accept_lens, accept_index, bs
+                    )
             self._mamba_side_stream_active = True
 
         if not batch.forward_mode.is_idle():
@@ -1231,6 +1266,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
+
+        with phase_span("eagle_v2.verify_end", **trace_fields):
+            pass
 
         # verify_forward_batch transitively holds verify-time GPU tensors
         # (draft_token / out_cache_loc / ...) that must outlive the imminent
