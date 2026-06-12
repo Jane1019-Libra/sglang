@@ -1138,13 +1138,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         Replays the state-update recurrence over stashed post-conv k/v/a/b and
         writes h_{accepted_step} directly to the request's SSM state slot.
         """
-        # Local imports to avoid a circular dependency at module load time.
+        # Local import to avoid a circular dependency at module load time.
         from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
-            fused_sigmoid_gating_delta_rule_recover_final_state,
+            fused_sigmoid_gating_delta_rule_recover_final_state_batched,
         )
 
-        stash_per_layer: dict = getattr(self.linear_attn_backend, "_no_cache_stash", {})
-        if not stash_per_layer:
+        stash = getattr(self.linear_attn_backend, "_no_cache_stash", None)
+        if not stash:
             # No GDN layer ran in cache_mode=none for this batch.
             return
 
@@ -1164,25 +1164,30 @@ class HybridLinearAttnBackend(AttentionBackend):
         state_idx_i32 = state_indices_tensor.to(torch.int32).contiguous()
         accepted_steps_i32 = accepted_steps.to(torch.int32).contiguous()
 
-        # One launch per GDN layer. Slice persistent buffers to the current
-        # batch size instead of storing per-call sizes in the shared stash.
-        for layer_id, stash in stash_per_layer.items():
-            layer_cache = pool.mamba2_layer_cache(layer_id)
-            layer_ssm_states = layer_cache.temporal  # [size+1, HV, V, K]
+        # Full [num_mamba_layers, size+1, HV, V, K] SSM pool; the batched kernel
+        # indexes layer i_l into it, matching the stash's layer (slot) order.
+        ssm_states_all = pool.get_speculative_mamba2_params_all_layers().temporal
 
-            fused_sigmoid_gating_delta_rule_recover_final_state(
-                A_log=stash["A_log"],
-                a=stash["a"][:actual_seq_len],
-                dt_bias=stash["dt_bias"],
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                k=stash["k"][:, :actual_seq_len],
-                v=stash["v"][:, :actual_seq_len],
-                b=stash["b"][:actual_seq_len],
-                initial_state_source=layer_ssm_states,
-                initial_state_indices=state_idx_i32,
-                accepted_steps=accepted_steps_i32,
-                cache_steps=cache_steps,
-                use_qk_l2norm_in_kernel=True,
-                is_kda=False,
-            )
+        # Single launch over all GDN layers (the stash tensors carry a leading
+        # layer dim), instead of one launch per layer — removes the (L-1)x
+        # serial host-dispatch overhead that dominated this eager path.
+        # Invariant: every mamba layer writes its stash slot in the verify
+        # forward that precedes this call, so all L slots are current here. If a
+        # future change lets a subset of mamba layers skip the verify forward,
+        # this batched launch would replay stale/garbage slots — guard it then.
+        fused_sigmoid_gating_delta_rule_recover_final_state_batched(
+            A_log=stash["A_log"],
+            a=stash["a"][:, :actual_seq_len],
+            dt_bias=stash["dt_bias"],
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            k=stash["k"][:, :actual_seq_len],
+            v=stash["v"][:, :actual_seq_len],
+            b=stash["b"][:, :actual_seq_len],
+            initial_state_source=ssm_states_all,
+            initial_state_indices=state_idx_i32,
+            accepted_steps=accepted_steps_i32,
+            cache_steps=cache_steps,
+            use_qk_l2norm_in_kernel=True,
+            is_kda=False,
+        )

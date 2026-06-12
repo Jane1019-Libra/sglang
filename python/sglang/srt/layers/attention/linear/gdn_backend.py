@@ -280,10 +280,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         self.verify_intermediate_state_indices = torch.arange(
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
-        # Per-layer persistent buffers used by gdn_mtp_cache_mode=none recovery.
-        # Values are stable tensors or parameters; per-call sizes are derived
-        # from runtime tensors because the dict spans multiple CUDA graph captures.
-        self._no_cache_stash: Dict[int, Dict[str, torch.Tensor]] = {}
+        # Persistent layer-stacked buffers used by gdn_mtp_cache_mode=none
+        # recovery. Each tensor carries a leading [num_mamba_layers] dim so the
+        # whole stash feeds a single batched recovery launch (one kernel over
+        # all GDN layers) instead of one launch per layer. Stable addresses keep
+        # CUDA graph replay valid; per-call sizes are derived from runtime
+        # tensors because the buffers span multiple CUDA graph captures.
+        self._no_cache_stash: Optional[Dict[str, torch.Tensor]] = None
         # Cached once on first forward; stable across calls.
         self._no_cache_draft_token_num: Optional[int] = None
 
@@ -474,42 +477,59 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 max_tokens = self.req_to_token_pool.size * draft_token_num
                 actual_seq_len = query.shape[1]
 
-                stash_entry = self._no_cache_stash.get(layer.layer_id)
-                if stash_entry is None or stash_entry["k"].shape[1] < max_tokens:
+                stash = self._no_cache_stash
+                if stash is None or stash["k"].shape[1] < max_tokens:
                     # Allocate outside inference_mode so buffers can be updated
-                    # across forward invocations.
+                    # across forward invocations. One [num_mamba_layers, ...]
+                    # buffer per field; each GDN layer writes its own slice, so
+                    # the whole stash feeds a single batched recovery launch.
+                    num_mamba_layers = len(self.req_to_token_pool.mamba_map)
                     with torch.inference_mode(False):
-                        stash_entry = {
+                        stash = {
                             "k": torch.empty(
-                                (key.shape[0], max_tokens, *key.shape[2:]),
+                                (num_mamba_layers, max_tokens, *key.shape[2:]),
                                 dtype=key.dtype,
                                 device=key.device,
                             ),
                             "v": torch.empty(
-                                (value.shape[0], max_tokens, *value.shape[2:]),
+                                (num_mamba_layers, max_tokens, *value.shape[2:]),
                                 dtype=value.dtype,
                                 device=value.device,
                             ),
                             "a": torch.empty(
-                                (max_tokens, *a.shape[1:]),
+                                (num_mamba_layers, max_tokens, *a.shape[1:]),
                                 dtype=a.dtype,
                                 device=a.device,
                             ),
                             "b": torch.empty(
-                                (max_tokens, *b.shape[1:]),
+                                (num_mamba_layers, max_tokens, *b.shape[1:]),
                                 dtype=b.dtype,
                                 device=b.device,
                             ),
-                            "A_log": layer.A_log,
-                            "dt_bias": layer.dt_bias,
+                            "A_log": torch.empty(
+                                (num_mamba_layers, *layer.A_log.shape),
+                                dtype=layer.A_log.dtype,
+                                device=layer.A_log.device,
+                            ),
+                            "dt_bias": torch.empty(
+                                (num_mamba_layers, *layer.dt_bias.shape),
+                                dtype=layer.dt_bias.dtype,
+                                device=layer.dt_bias.device,
+                            ),
                         }
-                    self._no_cache_stash[layer.layer_id] = stash_entry
+                    self._no_cache_stash = stash
+                # Write this layer's slot (compact mamba index) so the stacked
+                # stash matches the layer order of the SSM state pool that the
+                # batched recovery kernel indexes by i_l.
+                slot = self.req_to_token_pool.mamba_map[layer.layer_id]
                 # In-place slice copy with no new allocation; captured replays
                 # refresh the stable buffer slice for that graph's batch size.
-                stash_entry["k"][:, :actual_seq_len].copy_(key)
-                stash_entry["v"][:, :actual_seq_len].copy_(value)
-                stash_entry["a"][:actual_seq_len].copy_(a)
-                stash_entry["b"][:actual_seq_len].copy_(b)
+                stash["k"][slot, :actual_seq_len].copy_(key[0])
+                stash["v"][slot, :actual_seq_len].copy_(value[0])
+                stash["a"][slot, :actual_seq_len].copy_(a)
+                stash["b"][slot, :actual_seq_len].copy_(b)
+                stash["A_log"][slot].copy_(layer.A_log)
+                stash["dt_bias"][slot].copy_(layer.dt_bias)
                 # Do not store per-call sizes or tensor aliases in the stash;
                 # eager recovery derives them from current runtime tensors.
                 if self._no_cache_draft_token_num is None:
