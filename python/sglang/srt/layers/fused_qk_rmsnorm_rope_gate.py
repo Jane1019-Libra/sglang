@@ -19,7 +19,7 @@ import triton
 import triton.language as tl
 
 # ---------------------------------------------------------------------------
-# v2 kernel — bf16 round-trip, full HEAD_BLOCK load, reload rotary for RoPE
+# v2 kernel — bf16 round-trip, single-pass load (no redundant rotary reload)
 # ---------------------------------------------------------------------------
 
 
@@ -49,6 +49,7 @@ def _fused_qk_rmsnorm_rope_gate_v2_kernel(
     INPUT_DTYPE: tl.constexpr,
     HEAD_BLOCK: tl.constexpr,
     ROT_HALF_BLOCK: tl.constexpr,
+    PASS_BLOCK: tl.constexpr,
     HAS_PASS: tl.constexpr,
     HAS_GATE: tl.constexpr,
 ):
@@ -69,36 +70,37 @@ def _fused_qk_rmsnorm_rope_gate_v2_kernel(
         w_ptr = q_weight_ptr
         out_base = q_out_ptr + token * stride_qo_t + local_head * HEAD_DIM
 
-    # --- RMSNorm over the full head_dim ---
-    head_offs = tl.arange(0, HEAD_BLOCK)
-    head_mask = head_offs < HEAD_DIM
-    x = tl.load(in_base + head_offs, mask=head_mask, other=0.0).to(tl.float32)
-    var = tl.sum(x * x, axis=0) / HEAD_DIM
-    inv_rms = tl.rsqrt(var + EPS)
-    w = tl.load(w_ptr + head_offs, mask=head_mask, other=0.0).to(tl.float32)
-    # bf16 round-trip: matches the unfused (norm → memory → RoPE) path exactly
-    x_norm = (x * inv_rms * w).to(INPUT_DTYPE).to(tl.float32)
-
-    # --- Pass-through tail [rotary_dim, head_dim): RMSNorm only ---
-    if HAS_PASS:
-        pass_mask = head_mask & (head_offs >= ROTARY_DIM)
-        tl.store(out_base + head_offs, x_norm, mask=pass_mask)
-
-    # --- Partial NeoX RoPE on first rotary_dim elements ---
-    # Reload rotary halves on a smaller block (hits L1 cache, negligible cost)
+    # --- Load rotary halves once; accumulate variance ---
     rot_offs = tl.arange(0, ROT_HALF_BLOCK)
     rot_mask = rot_offs < HALF_ROTARY
     x_r1 = tl.load(in_base + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
     x_r2 = tl.load(in_base + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0).to(
         tl.float32
     )
+    var_acc = tl.sum(x_r1 * x_r1) + tl.sum(x_r2 * x_r2)
+
+    # --- Load pass-through tail for variance; keep in registers for later store ---
+    if HAS_PASS:
+        pass_offs = tl.arange(0, PASS_BLOCK)
+        pass_mask = pass_offs < (HEAD_DIM - ROTARY_DIM)
+        x_pass = tl.load(
+            in_base + ROTARY_DIM + pass_offs, mask=pass_mask, other=0.0
+        ).to(tl.float32)
+        var_acc += tl.sum(x_pass * x_pass)
+
+    # --- RMSNorm ---
+    inv_rms = tl.rsqrt(var_acc / HEAD_DIM + EPS)
+
+    # --- Normalize rotary halves + bf16 round-trip ---
     w_r1 = tl.load(w_ptr + rot_offs, mask=rot_mask, other=0.0).to(tl.float32)
     w_r2 = tl.load(w_ptr + HALF_ROTARY + rot_offs, mask=rot_mask, other=0.0).to(
         tl.float32
     )
-    x_r1 = (x_r1 * inv_rms * w_r1).to(INPUT_DTYPE).to(tl.float32)
-    x_r2 = (x_r2 * inv_rms * w_r2).to(INPUT_DTYPE).to(tl.float32)
+    # bf16 round-trip: matches the unfused (norm → memory → RoPE) path exactly
+    x_r1_n = (x_r1 * inv_rms * w_r1).to(INPUT_DTYPE).to(tl.float32)
+    x_r2_n = (x_r2 * inv_rms * w_r2).to(INPUT_DTYPE).to(tl.float32)
 
+    # --- NeoX RoPE ---
     pos = tl.load(positions_ptr + token).to(tl.int64)
     cache_off = pos * stride_cos_t
     cos = tl.load(
@@ -109,16 +111,25 @@ def _fused_qk_rmsnorm_rope_gate_v2_kernel(
         mask=rot_mask,
         other=0.0,
     ).to(tl.float32)
-
-    o1 = x_r1 * cos - x_r2 * sin
-    o2 = x_r2 * cos + x_r1 * sin
+    o1 = x_r1_n * cos - x_r2_n * sin
+    o2 = x_r2_n * cos + x_r1_n * sin
     tl.store(out_base + rot_offs, o1, mask=rot_mask)
     tl.store(out_base + HALF_ROTARY + rot_offs, o2, mask=rot_mask)
+
+    # --- Pass-through tail [rotary_dim, head_dim): normalize and store ---
+    if HAS_PASS:
+        w_pass = tl.load(
+            w_ptr + ROTARY_DIM + pass_offs, mask=pass_mask, other=0.0
+        ).to(tl.float32)
+        x_pass_n = (x_pass * inv_rms * w_pass).to(INPUT_DTYPE).to(tl.float32)
+        tl.store(out_base + ROTARY_DIM + pass_offs, x_pass_n, mask=pass_mask)
 
     # --- Gate copy (Q heads only, verbatim) ---
     if HAS_GATE and not is_k:
         gate_in = in_base + HEAD_DIM
         gate_out = gate_out_ptr + token * stride_gate_t + local_head * HEAD_DIM
+        head_offs = tl.arange(0, HEAD_BLOCK)
+        head_mask = head_offs < HEAD_DIM
         g = tl.load(gate_in + head_offs, mask=head_mask, other=0.0)
         tl.store(gate_out + head_offs, g, mask=head_mask)
 
@@ -338,6 +349,8 @@ def fused_qk_gemma_rmsnorm_rope_gate_v2(
     half_rotary = rotary_dim // 2
     head_block = triton.next_power_of_2(head_dim)
     rot_half_block = triton.next_power_of_2(half_rotary)
+    pass_dim = head_dim - rotary_dim
+    pass_block = triton.next_power_of_2(pass_dim) if pass_dim > 0 else 1
     num_warps = max(1, head_block // 64)
 
     grid = (T, num_q_heads + num_kv_heads)
@@ -366,6 +379,7 @@ def fused_qk_gemma_rmsnorm_rope_gate_v2(
         INPUT_DTYPE=tl.bfloat16 if q_gate.dtype == torch.bfloat16 else tl.float16,
         HEAD_BLOCK=head_block,
         ROT_HALF_BLOCK=rot_half_block,
+        PASS_BLOCK=pass_block,
         HAS_PASS=rotary_dim < head_dim,
         HAS_GATE=has_gate,
         num_warps=num_warps,
