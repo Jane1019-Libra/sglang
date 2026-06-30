@@ -2537,6 +2537,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         T_max = self.server_args.speculative_num_draft_tokens
         if T_max is None:
             return
+        if getattr(self.server_args, "gdn_mtp_cache_mode", "full") == "full":
+            return  # recovery kernel is never called in full mode; skip prewarm
 
         try:
             from sglang.srt.layers.attention.hybrid_linear_attn_backend import (

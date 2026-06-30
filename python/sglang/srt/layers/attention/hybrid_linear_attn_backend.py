@@ -1325,65 +1325,93 @@ class HybridLinearAttnBackend(AttentionBackend):
 
         # One launch per GDN layer. Factored into a closure so it can run either
         # inline (CUDA graph capture) or on the side stream (eager overlap).
+        #
+        # For the FlashInfer path we pre-build per-layer argument tuples *before*
+        # entering the closure.  This hoists all Python overhead (bisect, view,
+        # dict lookups, .detach()) off the side-stream hot path so that
+        # _run_recovery() contains only bare kernel launches.  Without this, the
+        # 45-layer Python dispatch loop takes ~1.4 ms on the CPU, keeping the GPU
+        # main stream idle for that entire window instead of overlapping with
+        # draft_extend.
+        if use_fi_recovery:
+            import bisect
+
+            from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
+                gated_delta_rule_mtp,
+            )
+
+            B, T = batch_size, cache_steps
+            # Round B up to the next power-of-2 in [1, 2, 4, ..., 512] so the
+            # CuTe DSL JIT sees at most 10 distinct B values across all batches.
+            # Without padding each unique scheduler batch size triggers a ~37s
+            # recompilation; with padding the prewarm at startup covers all cases.
+            _PAD_BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+            pi = bisect.bisect_left(_PAD_BS, B)
+            B_pad = _PAD_BS[pi] if pi < len(_PAD_BS) else B
+            n_extra = B_pad - B
+            if n_extra > 0:
+                # Padding rows use accepted_steps=0 and state_idx=0 (slot 0 is the
+                # reserved dummy slot). With accepted_steps=0 the kernel sets
+                # loop_limit=0 for those rows — it reads no stash data and writes
+                # h_0 (= initial dummy state) back to slot 0.  The stash tensors
+                # are already allocated to max_tokens = pool_size × T_max, so
+                # viewing B_pad × T elements is always in-bounds and avoids any
+                # cat / zero-fill kernels on the side stream.
+                _z = accepted_steps_i32.new_zeros(n_extra)
+                acc_steps_pad = torch.cat([accepted_steps_i32, _z])
+                state_idx_pad = torch.cat([state_idx_i32, _z])
+                actual_seq_len_pad = B_pad * T
+            else:
+                acc_steps_pad = accepted_steps_i32
+                state_idx_pad = state_idx_i32
+                actual_seq_len_pad = actual_seq_len
+
+            # Build per-layer arg tuples once (CPU-only work: dict lookups,
+            # view/slice creation, ssm_states pointer fetch).
+            # A_log_f32 is pre-converted at stash allocation time (gdn_backend.py)
+            # so no dtype conversion happens here.
+            _fi_layer_args = [
+                (
+                    pool.mamba2_layer_cache(layer_id).temporal,
+                    stash["A_log_f32"],
+                    stash["a"][:actual_seq_len_pad].view(B_pad, T, stash["a"].shape[-1]),
+                    stash["dt_bias"],
+                    stash["k"][0, :actual_seq_len_pad].view(
+                        B_pad, T, stash["k"].shape[2], stash["k"].shape[3]
+                    ),
+                    stash["v"][0, :actual_seq_len_pad].view(
+                        B_pad, T, stash["v"].shape[2], stash["v"].shape[3]
+                    ),
+                    stash["b"][:actual_seq_len_pad].view(B_pad, T, stash["b"].shape[-1]),
+                )
+                for layer_id, stash in stash_per_layer.items()
+            ]
+        else:
+            _fi_layer_args = None
+
         def _run_recovery():
             if use_fi_recovery:
-                import bisect
-
-                from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
-                    gated_delta_rule_mtp,
-                )
-
-                B, T = batch_size, cache_steps
-                # Round B up to the next power-of-2 in [1, 2, 4, ..., 512] so the
-                # CuTe DSL JIT sees at most 10 distinct B values across all batches.
-                # Without padding each unique scheduler batch size triggers a ~37s
-                # recompilation; with padding the prewarm at startup covers all cases.
-                _PAD_BS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
-                pi = bisect.bisect_left(_PAD_BS, B)
-                B_pad = _PAD_BS[pi] if pi < len(_PAD_BS) else B
-                n_extra = B_pad - B
-                if n_extra > 0:
-                    # Padding rows use accepted_steps=0 and state_idx=0 (slot 0 is the
-                    # reserved dummy slot). With accepted_steps=0 the kernel sets
-                    # loop_limit=0 for those rows — it reads no stash data and writes
-                    # h_0 (= initial dummy state) back to slot 0.  The stash tensors
-                    # are already allocated to max_tokens = pool_size × T_max, so
-                    # viewing B_pad × T elements is always in-bounds and avoids any
-                    # cat / zero-fill kernels on the side stream.
-                    _z = accepted_steps_i32.new_zeros(n_extra)
-                    acc_steps_pad = torch.cat([accepted_steps_i32, _z])
-                    state_idx_pad = torch.cat([state_idx_i32, _z])
-                    actual_seq_len_pad = B_pad * T
-                else:
-                    acc_steps_pad = accepted_steps_i32
-                    state_idx_pad = state_idx_i32
-                    actual_seq_len_pad = actual_seq_len
                 # PR-3502 API: pass accepted_steps [B] int32 directly so the
                 # kernel handles per-sequence step counts on the GPU.  One call
                 # per layer (45 total) instead of 4-groups × 45 layers = 180.
                 # disable_output=True: state-only recovery, output is discarded.
-                for layer_id, stash in stash_per_layer.items():
-                    layer_ssm_states = pool.mamba2_layer_cache(layer_id).temporal
-                    # Zero-copy views: no cat or zero-fill GPU kernels are launched.
-                    # Rows B..B_pad-1 may contain stale data but are never read by
-                    # the kernel when their accepted_steps entry is 0.
-                    k_bat = stash["k"][0, :actual_seq_len_pad].view(
-                        B_pad, T, stash["k"].shape[2], stash["k"].shape[3]
-                    )
+                for (
+                    layer_ssm_states,
+                    A_log_f32,
+                    a_view,
+                    dt_bias,
+                    k_bat,
+                    v_view,
+                    b_view,
+                ) in _fi_layer_args:
                     gated_delta_rule_mtp(
-                        A_log=stash["A_log"].detach().float(),
-                        a=stash["a"][:actual_seq_len_pad].view(
-                            B_pad, T, stash["a"].shape[-1]
-                        ),
-                        dt_bias=stash["dt_bias"].detach(),
+                        A_log=A_log_f32,
+                        a=a_view,
+                        dt_bias=dt_bias,
                         q=k_bat,
                         k=k_bat,
-                        v=stash["v"][0, :actual_seq_len_pad].view(
-                            B_pad, T, stash["v"].shape[2], stash["v"].shape[3]
-                        ),
-                        b=stash["b"][:actual_seq_len_pad].view(
-                            B_pad, T, stash["b"].shape[-1]
-                        ),
+                        v=v_view,
+                        b=b_view,
                         initial_state_source=layer_ssm_states,
                         initial_state_indices=state_idx_pad,
                         output_state_indices=state_idx_pad,
@@ -1445,4 +1473,15 @@ class HybridLinearAttnBackend(AttentionBackend):
         # them. record_stream pins the memory until the side stream is done.
         state_idx_i32.record_stream(self._recovery_stream)
         accepted_steps_i32.record_stream(self._recovery_stream)
+        # When B is not an exact power-of-2, torch.cat creates NEW tensors for
+        # acc_steps_pad / state_idx_pad (different objects from accepted_steps_i32
+        # / state_idx_i32). These are used by the side-stream kernel but go out of
+        # scope when this function returns, allowing the CUDA allocator to reuse
+        # their backing memory on the main stream while the side stream is still
+        # reading them → cudaErrorIllegalAddress. record_stream pins them until the
+        # side stream is done. When n_extra==0 the padded tensors are the same
+        # Python objects as the originals; recording them twice is harmless.
+        if use_fi_recovery and n_extra > 0:
+            acc_steps_pad.record_stream(self._recovery_stream)
+            state_idx_pad.record_stream(self._recovery_stream)
         self._recovery_event_pending = True

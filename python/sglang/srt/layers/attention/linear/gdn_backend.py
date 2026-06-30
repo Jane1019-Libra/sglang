@@ -536,6 +536,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                             ),
                             "A_log": layer.A_log,
                             "dt_bias": layer.dt_bias,
+                            # Pre-converted for FlashInfer recovery (gated_delta_rule_mtp
+                            # requires float32 A_log). Computed once at stash allocation
+                            # to avoid a per-step .detach().float() in the recovery loop.
+                            "A_log_f32": layer.A_log.detach().float(),
                         }
                     self._no_cache_stash[layer.layer_id] = stash_entry
                 # In-place slice copy with no new allocation; captured replays
