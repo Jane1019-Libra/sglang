@@ -1163,6 +1163,13 @@ class HybridLinearAttnBackend(AttentionBackend):
         Replays the state-update recurrence over stashed post-conv k/v/a/b and
         writes h_{accepted_step} directly to the request's SSM state slot.
         """
+        import os
+
+        if os.environ.get("SGLANG_GDN_SKIP_RECOVERY", "0") == "1":
+            # EXPERIMENT (SGLANG_GDN_SKIP_RECOVERY=1): skip accepted-state recovery
+            # entirely to isolate the recovery kernel's e2e cost. Output is
+            # INCORRECT (SSM state left stale) — ITL / nsys overhead measurement only.
+            return
         # Local imports to avoid a circular dependency at module load time.
         from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
             fused_sigmoid_gating_delta_rule_recover_final_state,
