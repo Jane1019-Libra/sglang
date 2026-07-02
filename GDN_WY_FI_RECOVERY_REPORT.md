@@ -84,9 +84,15 @@ PR):
 
 | config | gsm8k accuracy |
 |---|--:|
-| WY + FlashInfer recovery | **0.9794** |
-| WY + Triton recovery | 0.9794 |
+| WY verify + Triton recovery | 0.9794 |
+| Triton verify + Triton recovery | 0.9794 |
 | `gdn-mtp-cache-mode=full` reference | 0.9779 |
+| **WY verify + FlashInfer recovery** | *measurement in progress — table will be updated* |
+
+Notes: the FlashInfer and Triton recovery kernels agree to bf16 rounding (max recovered-state
+difference ~1e-3, not bit-identical), accept length is unchanged across the recovery swap
+(3.27↔3.28), and the base PR reports 0.976–0.979 for its FlashInfer-recovery configuration —
+the same score is expected here, but it is being measured directly rather than assumed.
 
 ## Known remaining overheads (TODO)
 
