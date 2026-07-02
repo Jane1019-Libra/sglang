@@ -84,15 +84,16 @@ PR):
 
 | config | gsm8k accuracy |
 |---|--:|
+| **WY verify + FlashInfer recovery** | **0.9771** |
 | WY verify + Triton recovery | 0.9794 |
 | Triton verify + Triton recovery | 0.9794 |
 | `gdn-mtp-cache-mode=full` reference | 0.9779 |
-| **WY verify + FlashInfer recovery** | *measurement in progress — table will be updated* |
 
-Notes: the FlashInfer and Triton recovery kernels agree to bf16 rounding (max recovered-state
-difference ~1e-3, not bit-identical), accept length is unchanged across the recovery swap
-(3.27↔3.28), and the base PR reports 0.976–0.979 for its FlashInfer-recovery configuration —
-the same score is expected here, but it is being measured directly rather than assumed.
+The spread across all four configs (0.977–0.979) is within sampling noise: per-question std
+0.150 → standard error ≈ ±0.4pp at n=1319, temperature 0.6, and the two recovery kernels agree
+to bf16 rounding (max recovered-state difference ~1e-3, not bit-identical) so exact score
+equality is not expected. Accept length is unchanged across the recovery swap (3.27↔3.28), and
+the base PR reports 0.976–0.979 for its FlashInfer-recovery configuration — consistent.
 
 ## Known remaining overheads (TODO)
 
@@ -200,6 +201,25 @@ noise on one machine.
 gsm8k few-shot eval, same protocol as the base PR: 1319 questions, 8-shot,
 `max_new_tokens` 16384, temperature 0.6. Expected: **0.979** for both recovery kernels
 (bit-level accept/reject parity; accept length unchanged).
+
+### Kernel-level microbenchmark (FlashInfer's existing GDN bench)
+
+The FlashInfer recovery kernel can be benchmarked standalone with the benchmark that already
+ships in the FlashInfer fork branch (`benchmarks/bench_gdn_decode.py`), in recovery mode
+(state update on, output off, per-request accepted steps):
+
+```bash
+cd $FLASHINFER_SRC/benchmarks
+# TP4 per-GPU head shard of Qwen3.5-397B (q4/k4/v8), T=4 — matches the serving shape
+python bench_gdn_decode.py --version bf16_state --seq-len 4 \
+  --update-state --no-output --accepted-steps-mode random \
+  --num-q-heads 4 --num-k-heads 4 --num-v-heads 8 --batch-size 64 256
+```
+
+Observed on GB300: ~14.9 µs (batch 64) / ~35.8 µs (batch 256) per launch standalone. Note the
+in-situ per-launch time during live decode is higher (~64 µs at batch 256) because the recovery
+kernel contends for SMs/bandwidth with the concurrently executing MoE/attention streams —
+standalone and in-situ numbers measure different conditions.
 
 ### Per-step latency (optional, Nsight Systems)
 
