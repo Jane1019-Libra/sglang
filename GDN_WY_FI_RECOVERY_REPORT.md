@@ -110,11 +110,12 @@ follow-up work:
    side stream.** The recovery kernel clones its strided q(=k)/v inputs to canonical-compact
    layout. Two bit-exact eliminations were implemented and verified (q==k de-duplication → 90
    clones/step; direct strided reads → 0 clones/step, −19% recovery-stream time), but both are
-   **e2e-neutral today** because side-stream overlap hides the copies; the strided read also slows
-   the recovery kernel by ~7.8%/launch (less-coalesced loads).
-   *TODO: revisit once recovery is graph-resident/critical-path (the savings then become real),
-   and improve strided-read coalescing; a strided path also needs a stride-faithful per-batch-size
-   prewarm to avoid one-time JIT compiles on first traffic.*
+   **e2e-neutral today** because side-stream overlap hides the copies. Strided reads are
+   cost-neutral for this kernel (verified standalone at the serving shape: layout and
+   cache-warmth deltas ~0.1 µs/launch).
+   *TODO: revisit once recovery is graph-resident/critical-path (the savings then become real);
+   a strided path also needs a stride-faithful per-batch-size prewarm to avoid one-time JIT
+   compiles on first traffic.*
 3. **Residual net recovery cost ≈ 0.85–0.9 ms/step over the no-recovery floor** — the remaining
    optimization target for the recovery stage.
 
@@ -210,16 +211,16 @@ ships in the FlashInfer fork branch (`benchmarks/bench_gdn_decode.py`), in recov
 
 ```bash
 cd $FLASHINFER_SRC/benchmarks
-# TP4 per-GPU head shard of Qwen3.5-397B (q4/k4/v8), T=4 — matches the serving shape
+# TP4 per-GPU head shard of Qwen3.5-397B (q4/k4/v16; model: 16 k-heads / 64 v-heads), T=4
 python bench_gdn_decode.py --version bf16_state --seq-len 4 \
   --update-state --no-output --accepted-steps-mode random \
-  --num-q-heads 4 --num-k-heads 4 --num-v-heads 8 --batch-size 64 256
+  --num-q-heads 4 --num-k-heads 4 --num-v-heads 16 --batch-size 64 256
 ```
 
-Observed on GB300: ~14.9 µs (batch 64) / ~35.8 µs (batch 256) per launch standalone. Note the
-in-situ per-launch time during live decode is higher (~64 µs at batch 256) because the recovery
-kernel contends for SMs/bandwidth with the concurrently executing MoE/attention streams —
-standalone and in-situ numbers measure different conditions.
+Observed on GB300: ~23.3 µs (batch 64) / ~58.7 µs (batch 256) per launch with random
+per-request accepted steps — consistent with the ~57–64 µs per launch seen in live decode
+traces. The in-situ value scales with each step's accepted-token distribution (~55 µs at an
+average of ~2.5 accepted steps per request, up to ~65 µs when all requests accept the full 4).
 
 ### Per-step latency (optional, Nsight Systems)
 
