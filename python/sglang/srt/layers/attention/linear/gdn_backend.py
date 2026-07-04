@@ -501,53 +501,124 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # In cache_mode=none, keep post-conv GDN inputs for accepted-state
             # recovery. Persistent buffers give CUDA graph replay stable addresses.
             if intermediate_state_cache is None:
-                # Target layout: [1, max_tokens, heads, dim] where
-                # max_tokens = pool.size * draft_token_num covers any
-                # batch size SGLang may capture a CUDA graph for.
                 draft_token_num = forward_batch.spec_info.draft_token_num
-                max_tokens = self.req_to_token_pool.size * draft_token_num
+                pool_size = self.req_to_token_pool.size
+                max_tokens = pool_size * draft_token_num
                 actual_seq_len = query.shape[1]
+                batch_size = actual_seq_len // draft_token_num
+
+                # FlashInfer recovery expects [B, T, H] tensors. Pre-shape the
+                # stash as [pool_size, T, H] so that slicing [:B] at recovery
+                # time already yields the correct shape — no .view() needed.
+                # Triton recovery takes flat tensors; keep the original layout.
+                _dk = self.kernel_dispatcher.decode_kernel
+                _fi_shaped = (
+                    _dk.__class__.__name__ == "FlashInferGDNKernel"
+                    and getattr(_dk, "use_state_pool", False)
+                )
 
                 stash_entry = self._no_cache_stash.get(layer.layer_id)
-                if stash_entry is None or stash_entry["k"].shape[1] < max_tokens:
+                if _fi_shaped:
+                    needs_realloc = (
+                        stash_entry is None
+                        or not stash_entry.get("fi_shaped", False)
+                        or stash_entry["k"].shape[0] < pool_size
+                    )
+                else:
+                    needs_realloc = (
+                        stash_entry is None
+                        or stash_entry.get("fi_shaped", False)
+                        or stash_entry["k"].shape[1] < max_tokens
+                    )
+
+                if needs_realloc:
                     # Allocate outside inference_mode so buffers can be updated
                     # across forward invocations.
                     with torch.inference_mode(False):
-                        stash_entry = {
-                            "k": torch.empty(
-                                (key.shape[0], max_tokens, *key.shape[2:]),
-                                dtype=key.dtype,
-                                device=key.device,
-                            ),
-                            "v": torch.empty(
-                                (value.shape[0], max_tokens, *value.shape[2:]),
-                                dtype=value.dtype,
-                                device=value.device,
-                            ),
-                            "a": torch.empty(
-                                (max_tokens, *a.shape[1:]),
-                                dtype=a.dtype,
-                                device=a.device,
-                            ),
-                            "b": torch.empty(
-                                (max_tokens, *b.shape[1:]),
-                                dtype=b.dtype,
-                                device=b.device,
-                            ),
-                            "A_log": layer.A_log,
-                            "dt_bias": layer.dt_bias,
-                            # Pre-converted for FlashInfer recovery (gated_delta_rule_mtp
-                            # requires float32 A_log). Computed once at stash allocation
-                            # to avoid a per-step .detach().float() in the recovery loop.
-                            "A_log_f32": layer.A_log.detach().float(),
-                        }
+                        if _fi_shaped:
+                            stash_entry = {
+                                "fi_shaped": True,
+                                "k": torch.empty(
+                                    (pool_size, draft_token_num, *key.shape[2:]),
+                                    dtype=key.dtype,
+                                    device=key.device,
+                                ),
+                                "v": torch.empty(
+                                    (pool_size, draft_token_num, *value.shape[2:]),
+                                    dtype=value.dtype,
+                                    device=value.device,
+                                ),
+                                "a": torch.empty(
+                                    (pool_size, draft_token_num, *a.shape[1:]),
+                                    dtype=a.dtype,
+                                    device=a.device,
+                                ),
+                                "b": torch.empty(
+                                    (pool_size, draft_token_num, *b.shape[1:]),
+                                    dtype=b.dtype,
+                                    device=b.device,
+                                ),
+                                "A_log": layer.A_log,
+                                "dt_bias": layer.dt_bias,
+                                # A_log is always float32 (all GDN models define it
+                                # with dtype=torch.float32). No detach or cast needed.
+                                "A_log_f32": layer.A_log,
+                            }
+                        else:
+                            stash_entry = {
+                                "fi_shaped": False,
+                                "k": torch.empty(
+                                    (key.shape[0], max_tokens, *key.shape[2:]),
+                                    dtype=key.dtype,
+                                    device=key.device,
+                                ),
+                                "v": torch.empty(
+                                    (value.shape[0], max_tokens, *value.shape[2:]),
+                                    dtype=value.dtype,
+                                    device=value.device,
+                                ),
+                                "a": torch.empty(
+                                    (max_tokens, *a.shape[1:]),
+                                    dtype=a.dtype,
+                                    device=a.device,
+                                ),
+                                "b": torch.empty(
+                                    (max_tokens, *b.shape[1:]),
+                                    dtype=b.dtype,
+                                    device=b.device,
+                                ),
+                                "A_log": layer.A_log,
+                                "dt_bias": layer.dt_bias,
+                                # A_log is always float32 (all GDN models define it
+                                # with dtype=torch.float32). No detach or cast needed.
+                                "A_log_f32": layer.A_log,
+                            }
                     self._no_cache_stash[layer.layer_id] = stash_entry
-                # In-place slice copy with no new allocation; captured replays
-                # refresh the stable buffer slice for that graph's batch size.
-                stash_entry["k"][:, :actual_seq_len].copy_(key)
-                stash_entry["v"][:, :actual_seq_len].copy_(value)
-                stash_entry["a"][:actual_seq_len].copy_(a)
-                stash_entry["b"][:actual_seq_len].copy_(b)
+
+                # In-place copy into the stash buffer.
+                if _fi_shaped:
+                    # key/value arrive flat [1, B*T, H, K]; view into [B, T, H, K]
+                    # before copying so the 3D stash slice aligns correctly.
+                    stash_entry["k"][:batch_size].copy_(
+                        key[0].view(batch_size, draft_token_num, *key.shape[2:])
+                    )
+                    stash_entry["v"][:batch_size].copy_(
+                        value[0].view(batch_size, draft_token_num, *value.shape[2:])
+                    )
+                    stash_entry["a"][:batch_size].copy_(
+                        a.view(batch_size, draft_token_num, *a.shape[1:])
+                    )
+                    stash_entry["b"][:batch_size].copy_(
+                        b.view(batch_size, draft_token_num, *b.shape[1:])
+                    )
+                else:
+                    # Flat layout: copy the B*T-token slice as-is. Captured
+                    # replays refresh the stable buffer slice for that batch size.
+                    stash_entry["k"][:, :actual_seq_len].copy_(key)
+                    stash_entry["v"][:, :actual_seq_len].copy_(value)
+                    stash_entry["a"][:actual_seq_len].copy_(a)
+                    stash_entry["b"][:actual_seq_len].copy_(b)
+
                 # Do not store per-call sizes or tensor aliases in the stash;
                 # eager recovery derives them from current runtime tensors.
                 if self._no_cache_draft_token_num is None:
