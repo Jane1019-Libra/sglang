@@ -967,6 +967,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         self._recovery_stream: Optional[torch.cuda.Stream] = None
         self._recovery_event: Optional[torch.cuda.Event] = None
         self._recovery_event_pending: bool = False
+        # CUDA graph for FlashInfer recovery: replace the ~45 per-layer kernel
+        # launches (~675us of CPU dispatch) with a single replay (~10us). Captured
+        # AND replayed on _recovery_stream so it still overlaps draft_extend + next
+        # draft. Stable fixed-address buffers hold the per-step state/accepted-step
+        # indices; contents are refreshed each step before replay.
+        self._rec_state_idx_buf: Optional[torch.Tensor] = None
+        self._rec_acc_steps_buf: Optional[torch.Tensor] = None
+        self._rec_graphs: dict[int, torch.cuda.CUDAGraph] = {}
 
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
@@ -1300,12 +1308,31 @@ class HybridLinearAttnBackend(AttentionBackend):
                 gated_delta_rule_mtp,
             )
             B = batch_size
-            logger.debug("[gdn_recovery] FlashInfer recovery B=%d", B)
+            logger.debug("[gdn_recovery] FlashInfer recovery (cuda graph) B=%d", B)
+
+            # Lazy-allocate stable fixed-address buffers for CUDA graph replay.
+            if self._rec_state_idx_buf is None:
+                pool_size = pool.size
+                dev = state_indices_tensor.device
+                self._rec_state_idx_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
+                self._rec_acc_steps_buf = torch.empty(
+                    pool_size, dtype=torch.int32, device=dev
+                )
+            # Refresh stable buffer contents on the main stream before replay
+            # (recovery_stream.wait_stream below orders the side-stream read after).
+            self._rec_state_idx_buf[:B].copy_(state_idx_i32)
+            self._rec_acc_steps_buf[:B].copy_(accepted_steps_i32)
 
         def _run_recovery():
             if use_fi_recovery:
                 # PR-3502 API: one call per layer (45 total), state-only recovery.
                 # Stash is pre-shaped [pool_size, T, H] so [:B] is already [B, T, H].
+                # Read indices from the stable buffers so the captured graph stays
+                # valid across replays (their addresses never change).
+                _state_idx = self._rec_state_idx_buf[:B]
+                _acc_steps = self._rec_acc_steps_buf[:B]
                 for layer_id, stash in stash_per_layer.items():
                     layer_ssm_states = pool.mamba2_layer_cache(layer_id).temporal
                     gated_delta_rule_mtp(
@@ -1317,9 +1344,9 @@ class HybridLinearAttnBackend(AttentionBackend):
                         v=stash["v"][:B],
                         b=stash["b"][:B],
                         initial_state_source=layer_ssm_states,
-                        initial_state_indices=state_idx_i32,
-                        output_state_indices=state_idx_i32,
-                        accepted_steps=accepted_steps_i32,
+                        initial_state_indices=_state_idx,
+                        output_state_indices=_state_idx,
+                        accepted_steps=_acc_steps,
                         disable_state_update=False,
                         disable_output=True,
                         use_qk_l2norm_in_kernel=True,
@@ -1363,18 +1390,35 @@ class HybridLinearAttnBackend(AttentionBackend):
         if self._recovery_stream is None:
             self._recovery_stream = torch.cuda.Stream()
             self._recovery_event = torch.cuda.Event()
-        # Recovery must observe the stash writes issued on the current stream
-        # during this step's verify forward.
+        # Recovery must observe the stash writes and (FI) stable-buffer copies
+        # issued on the current stream during this step's verify forward.
         self._recovery_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._recovery_stream):
-            _run_recovery()
+
+        if use_fi_recovery:
+            # CUDA graph path: capture once per B, then replay every step.
+            # Capture RECORDS the launches without executing them, so we must
+            # replay afterwards (including on the capture step) for the recovery
+            # to actually run. Both capture and replay happen on _recovery_stream
+            # so the work still overlaps draft_extend + next draft.
+            if B not in self._rec_graphs:
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, stream=self._recovery_stream):
+                    _run_recovery()
+                self._rec_graphs[B] = g
+                logger.debug("[gdn_recovery] captured recovery graph B=%d", B)
+            with torch.cuda.stream(self._recovery_stream):
+                self._rec_graphs[B].replay()
+        else:
+            with torch.cuda.stream(self._recovery_stream):
+                _run_recovery()
+
         self._recovery_event.record(self._recovery_stream)
-        # state_idx_i32 / accepted_steps_i32 are fresh allocations issued on the
-        # current (main) stream but consumed by the side-stream recovery kernels.
-        # wait_stream orders but does not extend their lifetime: once this
-        # function returns the locals drop and the caching allocator may reuse
-        # the blocks on the main stream while the side stream is still reading
-        # them. record_stream pins the memory until the side stream is done.
-        state_idx_i32.record_stream(self._recovery_stream)
-        accepted_steps_i32.record_stream(self._recovery_stream)
+        # FlashInfer path reads only the long-lived stable buffers on the side
+        # stream, so the per-step state_idx_i32 / accepted_steps_i32 need no
+        # record_stream. Triton path reads them directly on the side stream:
+        # wait_stream orders but does not extend their lifetime, so pin the
+        # blocks until the side-stream recovery is done.
+        if not use_fi_recovery:
+            state_idx_i32.record_stream(self._recovery_stream)
+            accepted_steps_i32.record_stream(self._recovery_stream)
         self._recovery_event_pending = True
