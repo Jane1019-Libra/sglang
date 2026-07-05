@@ -2566,11 +2566,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             state_source = mamba_pool.mamba_cache.temporal[0]
             if state_source.numel() == 0:
                 return
-            H = state_source.shape[1]  # num_heads_local
+            H = state_source.shape[1]  # num_v_heads (HV), TP-local
             V = state_source.shape[2]  # head_v_dim
             K = state_source.shape[3]  # head_k_dim
             dev = state_source.device
             ssm_dtype = state_source.dtype
+
+            # The SSM state is shaped with num_v_heads (= H), but the real recovery
+            # passes q/k with num_k_heads (gdn_backend does
+            # key.view(..., layer.num_k_heads, layer.head_k_dim)). On GQA GDN models
+            # (num_k_heads != num_v_heads, e.g. Qwen3.5) these differ, and the CuTe
+            # JIT cache_key carries the q/k head count separately from HV — so the
+            # dummy q/k MUST use num_k_heads, else the prewarmed cache_key never
+            # matches the real recovery call (cache miss → ~37s JIT stall on the
+            # first live request). Read the TP-local num_k_heads straight off the
+            # RadixLinearAttention layer (built with num_k_heads // attn_tp_size),
+            # which is the exact object the recovery reads.
+            from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+
+            qk_heads, qk_head_dim = H, K  # fallback: assume num_k_heads == num_v_heads
+            for _m in self.model.modules():
+                if isinstance(_m, RadixLinearAttention):
+                    qk_heads = _m.num_k_heads
+                    qk_head_dim = _m.head_k_dim
+                    break
 
             from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
                 gated_delta_rule_mtp,
@@ -2589,7 +2608,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 for T in range(1, T_max + 1):
                     dummy_idx = torch.zeros(B_pad, dtype=torch.int32, device=dev)
                     dummy_acc = torch.zeros(B_pad, dtype=torch.int32, device=dev)
-                    dummy_k = torch.zeros(B_pad, T, H, K, dtype=ssm_dtype, device=dev)
+                    # q/k use num_k_heads (qk_heads); v/a/b/A_log/dt_bias use num_v_heads (H).
+                    dummy_k = torch.zeros(
+                        B_pad, T, qk_heads, qk_head_dim, dtype=ssm_dtype, device=dev
+                    )
                     dummy_v = torch.zeros(B_pad, T, H, V, dtype=ssm_dtype, device=dev)
                     dummy_a = torch.zeros(B_pad, T, H, dtype=ssm_dtype, device=dev)
                     dummy_b = torch.zeros(B_pad, T, H, dtype=ssm_dtype, device=dev)
