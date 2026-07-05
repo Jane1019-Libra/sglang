@@ -990,6 +990,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if not in_capture and not forward_batch.forward_mode.is_draft_extend_v2():
+            self._wait_recovery_if_pending()
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_out_graph(
                 forward_batch, in_capture=in_capture
@@ -1043,38 +1045,6 @@ class HybridLinearAttnBackend(AttentionBackend):
                 forward_mode,
                 spec_info,
             )
-
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        if not forward_mode.is_draft_extend_v2():
-            # Join the prior step's side-stream SSM recovery before this target
-            # forward (replayed graph) reads / overwrites the SSM pool & stash.
-            # NOTE: under SGLANG_ENABLE_OVERLAP_PLAN_STREAM this runs on
-            # plan_stream, not the replay (fwd) stream; correctness relies on the
-            # worker doing fwd_stream.wait_stream(plan_stream) before the replay
-            # (eagle_worker_v2.verify), which transitively propagates this wait.
-            self._wait_recovery_if_pending()
-        for attn_backend in self.attn_backend_list:
-            attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                seq_lens_sum,
-                encoder_lens,
-                forward_mode,
-                spec_info,
-                seq_lens_cpu,
-            )
-
 
     def get_cuda_graph_seq_len_fill_value(self):
         return self.full_attn_backend.get_cuda_graph_seq_len_fill_value()
@@ -1330,6 +1300,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 gated_delta_rule_mtp,
             )
             B = batch_size
+            logger.debug("[gdn_recovery] FlashInfer recovery B=%d", B)
 
         def _run_recovery():
             if use_fi_recovery:
