@@ -933,6 +933,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             self.decode_cuda_graph_runner = self.eager_runner
 
+        # gdn_mtp_cache_mode=none: capture the SSM-state recovery cuda graphs now
+        # (device is quiesced and the target_verify capture above has allocated
+        # the per-layer recovery stash at its final addresses). Serving then
+        # replays per-bucket instead of dispatching ~45 kernels each step.
+        self.maybe_capture_gdn_recovery_graphs()
+
         # Register forward hooks AFTER cuda-graph capture so their tensor ops are
         # not traced into any captured graph — capture stays hook-free and hooks
         # fire only on the eager forward path (capture replay never runs Python
@@ -2641,6 +2647,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.info(f"GDN recovery JIT pre-warm done in {elapsed:.1f}s")
         except Exception as e:
             logger.warning(f"GDN recovery JIT pre-warm skipped: {e}")
+
+    def maybe_capture_gdn_recovery_graphs(self):
+        """Capture per-bucket FlashInfer SSM-state recovery cuda graphs at warmup.
+
+        Called from init_cuda_graphs AFTER the decode/target_verify graphs are
+        captured, so the per-layer recovery stash is already allocated at its
+        final addresses. Delegates to HybridLinearAttnBackend, which pads the
+        serving batch up to a captured bucket and replays on the side stream (no
+        live capture). Any failure falls back to eager side-stream recovery.
+        """
+        if self.device != "cuda" or self.is_draft_worker:
+            return
+        if getattr(self.server_args, "gdn_mtp_cache_mode", "full") == "full":
+            return
+        try:
+            from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+                HybridLinearAttnBackend,
+            )
+
+            if not isinstance(self.attn_backend, HybridLinearAttnBackend):
+                return
+            capture_bs = getattr(self.decode_cuda_graph_runner, "capture_bs", None)
+            if not capture_bs:
+                return
+            self.attn_backend.capture_recovery_graphs(capture_bs)
+        except Exception as e:
+            logger.warning(f"GDN recovery cuda graph capture skipped: {e}")
 
     def maybe_update_ngram_token_table(
         self,
